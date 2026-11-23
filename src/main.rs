@@ -59,6 +59,10 @@ fn pixel_to_hex(pos: Vec2) -> IVec2 {
     }
 }
 
+fn mouse_hex_position(cam: &Camera2D) -> IVec2 {
+    pixel_to_hex(cam.screen_to_world(Vec2::from(mouse_position())))
+}
+
 // Extract logic out to a function
 // Inline it so there is no performance cost for calling in a hotloop
 #[inline]
@@ -107,7 +111,22 @@ fn draw_cell(cell: Ref<Cell>, x: i32, y: i32) {
                 WHITE,
             );
         }
-        Land::Food(_) => todo!(),
+        Land::Food(food) => {
+            draw_text(
+                "Food",
+                graphical_pos.x - HEX_RADIUS / 1.7,
+                graphical_pos.y - HEX_RADIUS / 4.0,
+                HEX_RADIUS / 1.5,
+                WHITE,
+            );
+            draw_text(
+                food.to_string(),
+                graphical_pos.x - HEX_RADIUS / 5.0,
+                graphical_pos.y + HEX_RADIUS / 4.0,
+                HEX_RADIUS / 1.5,
+                WHITE,
+            );
+        },
     }
 }
 
@@ -150,8 +169,29 @@ async fn main() {
                 cam.target.x -= mouse_pos.x / cam_zoom * screen_width() / screen_height();
                 cam.target.y -= mouse_pos.y / cam_zoom;
             }
-            // Add tiles
-            if is_mouse_button_pressed(MouseButton::Left) {}
+            // Add food to tiles
+            if is_mouse_button_pressed(MouseButton::Left) {
+                let tile_pos = mouse_hex_position(&cam);
+                if let Some(tile) = grid.get(tile_pos.x, tile_pos.y) {
+                    let tile_land = tile.borrow().land.clone();
+                    match tile_land {
+                        Land::Empty => {
+                            tile.borrow_mut().land = Land::Food(1.0);
+                        },
+                        Land::Nest(food) => {
+                            tile.borrow_mut().land = Land::Nest(food + 1.0);
+                        },
+                        Land::Food(food) => {
+                            tile.borrow_mut().land = Land::Food(food + 1.0);
+                        },
+                    }
+                } else {
+                    grid.set(tile_pos.x, tile_pos.y, RefCell::new(Cell {
+                        land: Land::Empty,
+                        ..Default::default()
+                    }));
+                }
+            }
         }
 
         // UPDATE
@@ -218,12 +258,12 @@ async fn main() {
 
                             update_cell(
                                 cell.borrow_mut(),
-                                top_left.map(|c: &RefCell<Cell>| c.borrow_mut()),
-                                top_right.map(|c: &RefCell<Cell>| c.borrow_mut()),
-                                left.map(|c: &RefCell<Cell>| c.borrow_mut()),
-                                right.map(|c: &RefCell<Cell>| c.borrow_mut()),
-                                bottom_left.map(|c: &RefCell<Cell>| c.borrow_mut()),
-                                bottom_right.map(|c: &RefCell<Cell>| c.borrow_mut()),
+                                top_left.map(RefCell::borrow_mut),
+                                top_right.map(RefCell::borrow_mut),
+                                left.map(RefCell::borrow_mut),
+                                right.map(RefCell::borrow_mut),
+                                bottom_left.map(RefCell::borrow_mut),
+                                bottom_right.map(RefCell::borrow_mut),
                             );
 
                             draw_cell(cell.borrow(), x, y);
@@ -239,7 +279,7 @@ async fn main() {
         // DRAW pt 2.
         {
             // Highlight hovered cell
-            let hex_pos = pixel_to_hex(cam.screen_to_world(Vec2::from(mouse_position())));
+            let hex_pos = mouse_hex_position(&cam);
             let graphical_pos = hex_to_pixel(hex_pos);
             draw_hexagon(
                 graphical_pos.x,
