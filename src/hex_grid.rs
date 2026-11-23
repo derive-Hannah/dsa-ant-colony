@@ -1,14 +1,14 @@
-use std::{collections::VecDeque, fmt::{self, Display}};
+use std::{collections::VecDeque, fmt::{self, Display}, iter};
 
 /// Bi-direction-expandable hexagonal grid
 /// Implimented using double-ended queues
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HexGrid<CellType: Clone> {
+pub struct HexGrid<CellType: Clone + Default> {
 	y_offset: i32,
 	grid: VecDeque<(i32, VecDeque<CellType>)>,
 }
 
-impl<CellType: Clone> HexGrid<CellType> {
+impl<CellType: Clone + Default> HexGrid<CellType> {
 	/// Creates a new hex grid of size 0 at (0, 0)
 	pub fn new() -> Self {
 		Self { y_offset: 0, grid: VecDeque::new() }
@@ -26,8 +26,8 @@ impl<CellType: Clone> HexGrid<CellType> {
 	pub fn from_bounds_parallelagram(elm: CellType, x_left: i32, x_right: i32, y_bottom: i32, y_top: i32) -> Self {
 		Self {
 			y_offset: y_bottom,
-			grid: std::iter::repeat_n({
-				(x_left, std::iter::repeat_n(elm, (x_right - x_left + 1) as usize).collect())
+			grid: iter::repeat_n({
+				(x_left, iter::repeat_n(elm, (x_right - x_left + 1) as usize).collect())
 			}, (y_top - y_bottom + 1) as usize).collect()
 		}
 	}
@@ -46,8 +46,8 @@ impl<CellType: Clone> HexGrid<CellType> {
 	pub fn from_bounds_rparallelagram(elm: CellType, bottom_x_left: i32, bottom_x_right: i32, y_bottom: i32, y_top: i32) -> Self {
 		Self {
 			y_offset: y_bottom,
-			grid: std::iter::repeat_n({
-				std::iter::repeat_n(elm, (bottom_x_right - bottom_x_left + 1) as usize).collect()
+			grid: iter::repeat_n({
+				iter::repeat_n(elm, (bottom_x_right - bottom_x_left + 1) as usize).collect()
 			}, (y_top - y_bottom + 1) as usize).enumerate().map(|(idx, row)|
 				(bottom_x_left - (idx as i32), row)
 			).collect()
@@ -58,8 +58,8 @@ impl<CellType: Clone> HexGrid<CellType> {
 	///    D O C
 	///   O O O O
 	///  E O A O B
-	///  O O O O
-	///  F O G
+	///   O O O O
+	///    F O G
 	/// A is at (x, y)
 	/// B is at (x + radius, y)
 	/// C is at (x, y + radius)
@@ -71,13 +71,58 @@ impl<CellType: Clone> HexGrid<CellType> {
 		Self {
 			y_offset: y - radius,
 			grid: (-radius.abs()..=radius.abs()).map(|y_off| {
-				((x-y_off).max(0), std::iter::repeat_n(elm.clone(), (2 * radius + 1 - y_off.abs()) as usize).collect())
+				((x-y_off).max(0), iter::repeat_n(elm.clone(), (2 * radius + 1 - y_off.abs()) as usize).collect())
 			}).collect()
 		}
 	}
+
+	/// Get the value at the designated position, or None if it doesn't exist
+	pub fn get(&self, x: i32, y: i32) -> Option<&CellType> {
+		self.grid.get((y - self.y_offset) as usize).and_then(|(x_offset, row)| {
+			row.get((x - *x_offset) as usize)
+		})
+	}
+
+	/// Sets the cell at the position to contain the value provided
+	/// If the position is out of bounds, grow the grid to accomodate
+	pub fn set(&mut self, x: i32, y: i32, value: CellType) {
+		// Get row or extend y to fit
+		let real_y = y - self.y_offset;
+		let (x_offset, row) = if real_y < 0 {
+			self.y_offset += real_y;
+			self.grid.reserve(real_y.abs() as usize);
+			for _ in 0..real_y.abs() {
+				self.grid.push_front((0, VecDeque::from([CellType::default()])));
+			}
+			&mut self.grid[0]
+		} else if real_y as usize >= self.grid.len() {
+			self.grid.extend(iter::repeat_n((0, VecDeque::from([CellType::default()])), real_y as usize - self.grid.len() + 1));
+			&mut self.grid[real_y as usize]
+		} else {
+			&mut self.grid[real_y as usize]
+		};
+
+		// Get cell or extend x to fit
+		let real_x = x - *x_offset;
+		let cell = if real_x < 0 {
+			*x_offset += real_x;
+			row.reserve(real_x.abs() as usize);
+			for _ in 0..real_x.abs() {
+				row.push_front(CellType::default());
+			}
+			&mut row[0]
+		} else if real_x as usize >= row.len() {
+			row.extend(iter::repeat_n(CellType::default(), real_x as usize - row.len() + 1));
+			&mut row[real_x as usize]
+		} else {
+			&mut row[real_x as usize]
+		};
+
+		*cell = value
+	}
 }
 
-impl<CellType: Clone + Display> Display for HexGrid<CellType> {
+impl<CellType: Clone + Default + Display> Display for HexGrid<CellType> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (x_left, x_right) = self.grid.iter()
 			.fold((i32::MAX, i32::MIN), |acc, elm| (acc.0.min(elm.0), acc.1.max(elm.0 + elm.1.len() as i32 - 1)));
