@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     fmt::{self, Display},
     iter,
+    ops::Range,
 };
 
 /// Bi-direction-expandable hexagonal grid
@@ -100,7 +101,7 @@ impl<CellType: Clone + Default> HexGrid<CellType> {
             grid: (-radius.abs()..=radius.abs())
                 .map(|y_off| {
                     (
-                        (x - y_off).max(0),
+                        x - y_off.min(0),
                         iter::repeat_n(elm.clone(), (2 * radius + 1 - y_off.abs()) as usize)
                             .collect(),
                     )
@@ -116,6 +117,19 @@ impl<CellType: Clone + Default> HexGrid<CellType> {
             .and_then(|(x_offset, row)| row.get((x - *x_offset) as usize))
     }
 
+    pub fn get_row(&self, y: i32) -> Option<(i32, (&[CellType], &[CellType]))> {
+        if y < self.y_offset || (y - self.y_offset) as usize >= self.grid.len() {
+            None
+        } else {
+            let row = &self.grid[(y - self.y_offset) as usize];
+            Some((row.0, row.1.as_slices()))
+        }
+    }
+
+    pub fn y_bounds(&self) -> Range<i32> {
+        self.y_offset..(self.y_offset + self.grid.len() as i32)
+    }
+
     /// Sets the cell at the position to contain the value provided
     /// If the position is out of bounds, grow the grid to accomodate
     pub fn set(&mut self, x: i32, y: i32, value: CellType) {
@@ -123,7 +137,7 @@ impl<CellType: Clone + Default> HexGrid<CellType> {
         let real_y = y - self.y_offset;
         let (x_offset, row) = if real_y < 0 {
             self.y_offset += real_y;
-            self.grid.reserve(real_y.abs() as usize);
+            self.grid.reserve(real_y.unsigned_abs() as usize);
             for _ in 0..real_y.abs() {
                 self.grid
                     .push_front((0, VecDeque::from([CellType::default()])));
@@ -143,7 +157,7 @@ impl<CellType: Clone + Default> HexGrid<CellType> {
         let real_x = x - *x_offset;
         let cell = if real_x < 0 {
             *x_offset += real_x;
-            row.reserve(real_x.abs() as usize);
+            row.reserve(real_x.unsigned_abs() as usize);
             for _ in 0..real_x.abs() {
                 row.push_front(CellType::default());
             }
