@@ -1,5 +1,5 @@
 #![allow(clippy::type_complexity)]
-use std::cell::{Ref, RefCell, RefMut};
+use std::{cell::{Ref, RefCell, RefMut}, collections::VecDeque, iter};
 
 use macroquad::prelude::*;
 
@@ -10,8 +10,8 @@ use hex_grid::HexGrid;
 enum Land {
     #[default]
     Empty,
-    Nest(f32),
-    Food(f32),
+    Nest(u32),
+    Food(u32),
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -25,6 +25,10 @@ struct Cell {
 #[derive(Debug, Clone, PartialEq)]
 struct Ant {
     pos: Vec2,
+    carrying_food: bool,
+    updated_this_frame: bool,
+    moving_right: bool,
+    target: Option<IVec2>,
 }
 
 const HEX_RADIUS: f32 = 100.0;
@@ -63,11 +67,76 @@ fn mouse_hex_position(cam: &Camera2D) -> IVec2 {
     pixel_to_hex(cam.screen_to_world(Vec2::from(mouse_position())))
 }
 
+fn hex_distance(diff: IVec2) -> i32 {
+    (diff.x.abs() + diff.y.abs() + (diff.x + diff.y).abs()) / 2
+}
+
+fn movement_heuristic(from_pos: IVec2, to_pos: IVec2, carrying: bool, target: &Cell) -> f64 {
+    // Pull of nest when carrying food
+    const TO_NEST_WEIGHT: f64 = 3.0;
+    // Repel of nest when not carrying food
+    const AWAY_NEST_WEIGHT: f64 = 0.25;
+    // Pheremone influence
+    const FOUND_PHEREMONE_WEIGHT: f64 = 5.0;
+    const SEARCHING_PHEREMONE_WEIGHT: f64 = 1.0;
+
+
+    let mut score = 0.0;
+
+    let nest_aproachness = (hex_distance(from_pos) - hex_distance(to_pos)) as f64;
+    if carrying {
+        score += TO_NEST_WEIGHT * nest_aproachness;
+    } else {
+        score -= AWAY_NEST_WEIGHT * nest_aproachness;
+    }
+
+    if !carrying {
+        score += target.pheremone_found * FOUND_PHEREMONE_WEIGHT;
+        score -= target.pheremone_searching * SEARCHING_PHEREMONE_WEIGHT;
+    }
+
+    score
+}
+
+fn pick_neighbor(from_pos: IVec2, carrying: bool, neighbors: &[(IVec2, Option<RefMut<Cell>>); 6]) -> Option<usize> {
+    // Always prioritize food-containing cells when not carrying food
+    if !carrying {
+        if let Some(i) = neighbors.iter().position(|(_, n)| {
+            matches!(n.as_deref().map(|c| c.land), Some(Land::Food(f)) if f > 0)
+        }) {
+            return Some(i);
+        }
+    }
+
+    let mut weights = [0.0; 6];
+    let mut total = 0.0;
+    for (i, (offset, n)) in neighbors.iter().enumerate() {
+        if let Some(target) = n.as_deref() {
+            let w = movement_heuristic(from_pos, from_pos + *offset, carrying, target).exp() as f32;
+            weights[i] = w;
+            total += w;
+        }
+    }
+    if total <= 0.0 {
+        return None;
+    }
+
+    let mut roll = rand::gen_range(0.0, total);
+    for (i, w) in weights.iter().enumerate() {
+        roll -= *w;
+        if roll < 0.0 {
+            return Some(i);
+        }
+    }
+    // in case of floating point inprecision
+    weights.iter().rposition(|w| *w > 0.0)
+}
+
 // Extract logic out to a function
-// Inline it so there is no performance cost for calling in a hotloop
-#[inline]
 fn update_cell(
-    cell: RefMut<Cell>,
+    delta: f32,
+    cell_pos: IVec2,
+    mut cell: RefMut<Cell>,
     top_left: Option<RefMut<Cell>>,
     top_right: Option<RefMut<Cell>>,
     left: Option<RefMut<Cell>>,
@@ -77,12 +146,99 @@ fn update_cell(
 ) {
     // Be VERY mindful of performance here
     // This function is run for every cell, every frame.
+
+    const ANT_SPEED: f32 = 100.0;
+
+    let cell: &mut Cell = &mut cell;
+
+    let mut neighbors = [
+        (ivec2(0, -1), top_left),
+        (ivec2(1, -1), top_right),
+        (ivec2(-1, 0), left),
+        (ivec2(1, 0), right),
+        (ivec2(-1, 1), bottom_left),
+        (ivec2(0, 1), bottom_right),
+    ];
+
+    // Pheremone spread
+    let reduced_pheremone_found = cell.pheremone_found * (1.0 - 0.5f64.powf(delta as f64 * 0.5));
+    let reduced_pheremone_searching = cell.pheremone_searching * (1.0 - 0.5f64.powf(delta as f64));
+    cell.pheremone_found -= reduced_pheremone_found;
+    cell.pheremone_searching -= reduced_pheremone_searching;
+
+    for (_, cell) in &mut neighbors {
+        let Some(cell) = cell else { continue };
+        cell.pheremone_found += reduced_pheremone_found / 6.0;
+        cell.pheremone_searching += reduced_pheremone_searching / 6.0;
+    }
+
+    let ants = std::mem::take(&mut cell.ants);
+
+    for mut ant in ants {
+        if ant.updated_this_frame {
+            ant.updated_this_frame = false;
+            cell.ants.push(ant);
+            continue;
+        }
+
+        if ant.carrying_food {
+            if let Land::Nest(food) = &mut cell.land {
+                *food += 1;
+                ant.carrying_food = false;
+            }
+        } else if let Land::Food(food) = &mut cell.land {
+            *food -= 1;
+            ant.carrying_food = true;
+            if *food == 0 {
+                cell.land = Land::Empty;
+            }
+        }
+
+        if ant.carrying_food {
+            cell.pheremone_found += delta as f64;
+        }
+        cell.pheremone_searching += 0.8 * delta as f64;
+
+        // Choose target if none is selected and old target reached
+        if ant.target.is_none_or(|t| hex_to_pixel(t).distance(ant.pos) < HEX_RADIUS / 2.0) {
+            ant.target = pick_neighbor(cell_pos, ant.carrying_food, &neighbors)
+                .map(|i| cell_pos + neighbors[i].0);
+        }
+
+        // Move towards target
+        if let Some(target) = ant.target {
+            let towards_target = hex_to_pixel(target) - ant.pos;
+            ant.pos += towards_target.normalize_or_zero() * delta * ANT_SPEED;
+            match towards_target.x {
+                x if x > 0. => { ant.moving_right = true; },
+                x if x < 0. => { ant.moving_right = false; },
+                _ => { },
+            }
+        }
+
+        // And if this causes the current cell to change, move ant appropriately
+        let new_cell_pos = pixel_to_hex(ant.pos);
+        if let Some(i) = neighbors.iter().position(|(offset, _)| {
+            cell_pos + *offset == new_cell_pos
+        }) {
+            if let Some(new_cell) = neighbors[i].1.as_mut() {
+                ant.updated_this_frame = true;
+                new_cell.ants.push(ant);
+                continue;
+            }
+        }
+
+        // Otherwise, add back to the normal cell
+        cell.ants.push(ant);
+    }
 }
 
 // Same considerations as above
-#[inline]
-fn draw_cell(cell: Ref<Cell>, x: i32, y: i32) {
+fn draw_cell(cell: Ref<Cell>, x: i32, y: i32, ant_tex: &Texture2D, ant_grab_tex: &Texture2D, food_tex: &Texture2D) {
     let graphical_pos = hex_to_pixel(ivec2(x, y));
+    let mut color = GREEN;
+    color.b += cell.pheremone_searching as f32 / 10.0 - cell.pheremone_found as f32 / 5.0;
+    color.r += cell.pheremone_found as f32 / 5.0 - cell.pheremone_searching as f32 / 10.0;
     draw_hexagon(
         graphical_pos.x,
         graphical_pos.y,
@@ -90,8 +246,41 @@ fn draw_cell(cell: Ref<Cell>, x: i32, y: i32) {
         HEX_RADIUS / 10.0,
         true,
         DARKGREEN,
-        GREEN,
+        color,
     );
+
+    match cell.land {
+        Land::Empty | Land::Nest(_) => {}
+        Land::Food(_) => {
+            draw_texture_ex(
+                food_tex,
+                graphical_pos.x - 75.0,
+                graphical_pos.y - 75.0,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(150., 150.)),
+                    ..Default::default()
+                },
+            );
+        },
+    }
+
+    for ant in &cell.ants {
+        draw_texture_ex(
+            if ant.carrying_food {
+                ant_grab_tex
+            } else {
+                ant_tex
+            },
+            ant.pos.x - 32.0, ant.pos.y - 32.0,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(64., 64.)),
+                flip_x: ant.moving_right,
+                ..Default::default()
+            }
+        );
+    }
 
     match cell.land {
         Land::Empty => {}
@@ -101,30 +290,23 @@ fn draw_cell(cell: Ref<Cell>, x: i32, y: i32) {
                 graphical_pos.x - HEX_RADIUS / 1.7,
                 graphical_pos.y - HEX_RADIUS / 4.0,
                 HEX_RADIUS / 1.5,
-                WHITE,
+                BLACK,
             );
             draw_text(
                 food.to_string(),
                 graphical_pos.x - HEX_RADIUS / 5.0,
                 graphical_pos.y + HEX_RADIUS / 4.0,
                 HEX_RADIUS / 1.5,
-                WHITE,
+                BLACK,
             );
         }
         Land::Food(food) => {
             draw_text(
-                "Food",
-                graphical_pos.x - HEX_RADIUS / 1.7,
-                graphical_pos.y - HEX_RADIUS / 4.0,
-                HEX_RADIUS / 1.5,
-                WHITE,
-            );
-            draw_text(
                 food.to_string(),
-                graphical_pos.x - HEX_RADIUS / 5.0,
-                graphical_pos.y + HEX_RADIUS / 4.0,
+                graphical_pos.x - HEX_RADIUS / 4.0,
+                graphical_pos.y + HEX_RADIUS / 5.0,
                 HEX_RADIUS / 1.5,
-                WHITE,
+                BLACK,
             );
         },
     }
@@ -132,6 +314,10 @@ fn draw_cell(cell: Ref<Cell>, x: i32, y: i32) {
 
 #[macroquad::main("Ant Simulation")]
 async fn main() {
+    let ant_tex = load_texture("art/ant.png").await.unwrap();
+    let ant_grab_tex = load_texture("art/ant_grab.png").await.unwrap();
+    let food_tex = load_texture("art/cabbage.png").await.unwrap();
+
     let mut cam = Camera2D {
         target: vec2(0., 0.0),
         ..Default::default()
@@ -140,17 +326,23 @@ async fn main() {
     let mut cam_zoom = 0.0005;
 
     let mut grid =
-        HexGrid::<RefCell<Cell>>::from_bounds_hexagon(RefCell::new(Cell::default()), -1, 0, 1);
+        HexGrid::<RefCell<Cell>>::from_bounds_hexagon(RefCell::new(Cell::default()), 0, 0, 6);
     grid.set(
         0,
         0,
         RefCell::new(Cell {
-            land: Land::Nest(0.0),
+            land: Land::Nest(0),
+            ants: iter::repeat_n(Ant { pos: vec2(0.0, 0.0), carrying_food: false, moving_right: false, updated_this_frame: false, target: None }, 30).collect(),
             ..Default::default()
         }),
     );
 
+    let mut fps_queue = VecDeque::new();
+
     loop {
+        // Deltatime shouldn't go to huge numbers for lag spikes, so cap it
+        let delta = get_frame_time().min(0.1 /* min. 10 fps */);
+
         // INPUT HANDLING
         {
             // Pan camera
@@ -176,13 +368,13 @@ async fn main() {
                     let tile_land = tile.borrow().land.clone();
                     match tile_land {
                         Land::Empty => {
-                            tile.borrow_mut().land = Land::Food(1.0);
+                            tile.borrow_mut().land = Land::Food(1);
                         },
                         Land::Nest(food) => {
-                            tile.borrow_mut().land = Land::Nest(food + 1.0);
+                            tile.borrow_mut().land = Land::Nest(food + 1);
                         },
                         Land::Food(food) => {
-                            tile.borrow_mut().land = Land::Food(food + 1.0);
+                            tile.borrow_mut().land = Land::Food(food + 1);
                         },
                     }
                 } else {
@@ -195,7 +387,20 @@ async fn main() {
         }
 
         // UPDATE
-        {}
+        {
+            // Nest spawns ants
+            if let Some(mut nest) = grid.get(0, 0).map(RefCell::borrow_mut) && let Land::Nest(ref mut food) = nest.land {
+                // Random frequency, avg 1 ant per 2 seconds
+                if *food >= 4 && rand::gen_range(0, get_fps().max(1) * 2) == 0 {
+                    *food -= 4;
+                    nest.ants.push(Ant { pos: vec2(0., 0.), carrying_food: false, moving_right: false, updated_this_frame: false, target: None });
+                }
+            } else {
+                unreachable!();
+            }
+
+
+        }
 
         // DRAW pt. 1
         {
@@ -218,55 +423,52 @@ async fn main() {
                     while let Some(cell) = row_iter.next() {
                         let (top_left, top_right) = above
                             .map(|(above_x_offset, above_row)| {
-                                let mut above_row_iter = above_row
-                                    .0
-                                    .iter()
-                                    .chain(above_row.1.iter())
-                                    .skip((x - above_x_offset) as usize);
-                                if above_x_offset > x + 1 {
+                                let mut it = above_row.0.iter().chain(above_row.1.iter());
+                                let first = x - above_x_offset;
+                                if first < -1 {
                                     (None, None)
-                                } else if above_x_offset == x + 1 {
-                                    (None, above_row_iter.next())
+                                } else if first == -1 {
+                                    (None, it.next())
                                 } else {
-                                    (above_row_iter.next(), above_row_iter.next())
+                                    let mut it = it.skip(first as usize);
+                                    (it.next(), it.next())
                                 }
                             })
                             .unwrap_or((None, None));
+
                         let left = prev;
                         let right = row_iter.peek().copied();
+
                         let (bottom_left, bottom_right) = below
                             .map(|(below_x_offset, below_row)| {
-                                let mut below_row_iter = below_row
-                                    .0
-                                    .iter()
-                                    .chain(below_row.1.iter())
-                                    .skip((x - below_x_offset) as usize);
-                                if below_x_offset > x {
+                                let mut it = below_row.0.iter().chain(below_row.1.iter());
+                                let first = x - 1 - below_x_offset;
+                                if first < -1 {
                                     (None, None)
-                                } else if below_x_offset == x {
-                                    (None, below_row_iter.next())
+                                } else if first == -1 {
+                                    (None, it.next())
                                 } else {
-                                    (below_row_iter.next(), below_row_iter.next())
+                                    let mut it = it.skip(first as usize);
+                                    (it.next(), it.next())
                                 }
                             })
                             .unwrap_or((None, None));
 
                         {
                             // All operations on a cell are performed in the same loop.
-                            // This ensures we don't have to fetch the entire grid
-                            // from memory twice.
-
                             update_cell(
-                                cell.borrow_mut(),
-                                top_left.map(RefCell::borrow_mut),
-                                top_right.map(RefCell::borrow_mut),
-                                left.map(RefCell::borrow_mut),
-                                right.map(RefCell::borrow_mut),
-                                bottom_left.map(RefCell::borrow_mut),
-                                bottom_right.map(RefCell::borrow_mut),
+                                delta,
+                                ivec2(x, y),
+                                        cell.borrow_mut(),
+                                        top_left.map(RefCell::borrow_mut),
+                                        top_right.map(RefCell::borrow_mut),
+                                        left.map(RefCell::borrow_mut),
+                                        right.map(RefCell::borrow_mut),
+                                        bottom_left.map(RefCell::borrow_mut),
+                                        bottom_right.map(RefCell::borrow_mut),
                             );
 
-                            draw_cell(cell.borrow(), x, y);
+                            draw_cell(cell.borrow(), x, y, &ant_tex, &ant_grab_tex, &food_tex);
                         }
 
                         prev = Some(cell);
@@ -292,6 +494,16 @@ async fn main() {
             );
         }
 
+        fps_queue.push_back(get_fps());
+        if fps_queue.len() > 60 {
+            fps_queue.pop_front();
+        }
+        {
+            let top_left = cam.screen_to_world(vec2(0., 0.));
+            let text_bottom = cam.screen_to_world(vec2(0., 32.));
+            let font_size = text_bottom.y - top_left.y;
+            draw_text(&format!("FPS: {}", fps_queue.iter().sum::<i32>()/60), top_left.x, top_left.y + font_size * 0.5, font_size, crate::WHITE);
+        }
         next_frame().await
     }
 }

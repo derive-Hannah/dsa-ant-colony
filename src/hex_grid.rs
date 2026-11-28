@@ -15,6 +15,7 @@ pub struct HexGrid<CellType: Clone + Default> {
 
 impl<CellType: Clone + Default> HexGrid<CellType> {
     /// Creates a new hex grid of size 0 at (0, 0)
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             y_offset: 0,
@@ -31,6 +32,7 @@ impl<CellType: Clone + Default> HexGrid<CellType> {
     /// B is at (x_right, y_top)
     /// C is at (x_left, y_bottom)
     /// D is at (x_right, y_bottom)
+    #[allow(dead_code)]
     pub fn from_bounds_parallelagram(
         elm: CellType,
         x_left: i32,
@@ -63,6 +65,7 @@ impl<CellType: Clone + Default> HexGrid<CellType> {
     /// B is at (bottom_x_right - height, y_top)
     /// C is at (bottom_x_left, y_bottom)
     /// D is at (bottom_x_right, y_bottom)
+    #[allow(dead_code)]
     pub fn from_bounds_rparallelagram(
         elm: CellType,
         bottom_x_left: i32,
@@ -95,7 +98,9 @@ impl<CellType: Clone + Default> HexGrid<CellType> {
     /// E is at (x - radius, y)
     /// F is at (x, y - radius)
     /// G is at (x + radius, y - radius)
+    #[allow(dead_code)]
     pub fn from_bounds_hexagon(elm: CellType, x: i32, y: i32, radius: i32) -> Self {
+        let x = x - radius;
         Self {
             y_offset: y - radius,
             grid: (-radius.abs()..=radius.abs())
